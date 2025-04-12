@@ -17,11 +17,26 @@ This is a temporary hack to fix new videos not appearing on the feed.
 ENABLE_FEED_POLLING=true
 POLLING_INTERVAL_MINUTES=15
 POLLING_FETCH_LIMIT_PER_CHANNEL=10
+FEED_RETENTION=30
 ```
 4. After running `./configure-instance.sh` and selecting the relevant template, run the following to start the container:
 ```sh
 sudo DOCKER_BUILDKIT=1 docker-compose up -d
 ```
+
+### Workaround Configuration (`config.properties`)
+
+*   **`ENABLE_FEED_POLLING`**:
+    *   Set to `true` to enable the backend to periodically check subscribed channels for new videos, bypassing PubSub. Set to `false` (default) to disable this polling.
+
+*   **`POLLING_INTERVAL_MINUTES`**:
+    *   Specifies how often (in minutes) the backend should perform the polling cycle for all subscribed channels. Default: `15`.
+
+*   **`POLLING_FETCH_LIMIT_PER_CHANNEL`**:
+    *   Limits how many of the *most recent* videos are checked for each channel during a polling cycle. Helps improve performance and reduce load. Default: `10`.
+
+*   **`FEED_RETENTION`**:
+    *   Determines how many days old a video can be and still be added to the feed database (by polling or PubSub). Also affects how long videos are kept before cleanup. Default: `30`.
 
 # README.md:
 
