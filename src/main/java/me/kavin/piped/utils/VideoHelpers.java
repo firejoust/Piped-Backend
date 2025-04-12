@@ -6,9 +6,10 @@ import me.kavin.piped.consts.Constants;
 import me.kavin.piped.utils.obj.db.Video;
 import org.apache.commons.lang3.StringUtils;
 import org.hibernate.StatelessSession;
+import org.schabi.newpipe.extractor.exceptions.ParsingException; // Added import
 import org.schabi.newpipe.extractor.stream.StreamExtractor;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
-import org.schabi.newpipe.extractor.stream.StreamInfoItem;
+import org.schabi.newpipe.extractor.stream.StreamInfoItem; // Added import
 
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -88,6 +89,67 @@ public class VideoHelpers {
             }
         }
 
+    }
+
+    /**
+     * Handles inserting or updating a video based on a StreamInfoItem,
+     * avoiding redundant fetching if the item details are sufficient.
+     * Used primarily by the feed polling mechanism.
+     *
+     * @param item    The StreamInfoItem containing video details.
+     * @param time    The timestamp to use if creating a new video record (e.g., from PubSub).
+     * @param channel The Channel entity this video belongs to.
+     */
+    public static void handleNewVideo(StreamInfoItem item, long time, me.kavin.piped.utils.obj.db.Channel channel) {
+        if (item == null || channel == null) return;
+
+        // Check if video is recent enough based on upload date, if available
+        long infoTime = Optional.ofNullable(item.getUploadDate())
+                .map(date -> date.offsetDateTime().toInstant().toEpochMilli())
+                .orElse(System.currentTimeMillis()); // Fallback if no date
+
+        if ((System.currentTimeMillis() - infoTime) >= TimeUnit.DAYS.toMillis(Constants.FEED_RETENTION)) {
+            return; // Skip videos older than retention period
+        }
+
+        String videoId = null;
+        try {
+            videoId = YOUTUBE_SERVICE.getStreamLHFactory().getId(item.getUrl());
+        } catch (ParsingException e) {
+            ExceptionHandler.handle(e, "Failed to parse video ID from StreamInfoItem URL: " + item.getUrl());
+            return;
+        }
+
+        if (StringUtils.isBlank(videoId)) return;
+
+        try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
+            if (DatabaseHelper.doesVideoExist(s, videoId)) {
+                // Video exists, update it
+                updateVideo(videoId, item);
+            } else {
+                // Video doesn't exist, insert it
+                // Determine if it's a short (use item's property if available, else check API)
+                boolean isShort = item.isShortFormContent();
+                // Note: item.isShortFormContent() might not always be accurate.
+                // Calling isShort(videoId) is more reliable but adds an API call.
+                // We'll rely on the item's flag for polling efficiency.
+
+                Video video = new Video(
+                        videoId,
+                        item.getName(),
+                        item.getViewCount() > 0 ? item.getViewCount() : 0, // Ensure non-negative views
+                        item.getDuration() > 0 ? item.getDuration() : 0, // Ensure non-negative duration
+                        Math.max(infoTime, time), // Use upload date if available, else the provided time
+                        item.getThumbnails() != null && !item.getThumbnails().isEmpty() ? item.getThumbnails().getLast().getUrl() : null,
+                        isShort,
+                        channel
+                );
+                insertVideo(video); // Use the existing insert method
+            }
+        } catch (Exception e) {
+            // Handle potential exceptions during DB check or insert/update
+            ExceptionHandler.handle(e, "Error handling new video from StreamInfoItem: " + videoId);
+        }
     }
 
     public static boolean isShort(String videoId) throws Exception {
