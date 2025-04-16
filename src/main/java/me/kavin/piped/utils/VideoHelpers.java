@@ -6,10 +6,10 @@ import me.kavin.piped.consts.Constants;
 import me.kavin.piped.utils.obj.db.Video;
 import org.apache.commons.lang3.StringUtils;
 import org.hibernate.StatelessSession;
-import org.schabi.newpipe.extractor.exceptions.ParsingException; // Added import
+import org.schabi.newpipe.extractor.exceptions.ParsingException;
 import org.schabi.newpipe.extractor.stream.StreamExtractor;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
-import org.schabi.newpipe.extractor.stream.StreamInfoItem; // Added import
+import org.schabi.newpipe.extractor.stream.StreamInfoItem;
 
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -38,26 +38,30 @@ public class VideoHelpers {
             channel = DatabaseHelper.getChannelFromId(
                     info.getUploaderUrl().substring("https://www.youtube.com/channel/".length()));
 
-        long infoTime = info.getUploadDate() != null ? info.getUploadDate().offsetDateTime().toInstant().toEpochMilli()
-                : System.currentTimeMillis();
+        // Prioritize actual upload date
+        long infoTime = Optional.ofNullable(info.getUploadDate())
+                .map(date -> date.offsetDateTime().toInstant().toEpochMilli())
+                .orElse(time); // Fallback to provided time only if upload date is null
 
         if (channel != null
                 && (System.currentTimeMillis() - infoTime) < TimeUnit.DAYS.toMillis(Constants.FEED_RETENTION)) {
 
             info.setShortFormContent(isShort(info.getId()));
+            String latestThumbnailUrl = info.getThumbnails() != null && !info.getThumbnails().isEmpty() ? info.getThumbnails().getLast().getUrl() : null;
 
             try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
                 if (!DatabaseHelper.doesVideoExist(s, info.getId())) {
 
                     Video video = new Video(info.getId(), info.getName(), info.getViewCount(), info.getDuration(),
-                            Math.max(infoTime, time), info.getThumbnails().getLast().getUrl(), info.isShortFormContent(), channel);
+                            infoTime, // Use actual upload date
+                            latestThumbnailUrl, info.isShortFormContent(), channel);
 
                     insertVideo(video);
                     return;
                 }
             }
-
-            updateVideo(info.getId(), info, time);
+            // Video exists, update it
+            updateVideo(info.getId(), info, infoTime); // Pass infoTime here as well
 
         }
     }
@@ -68,12 +72,15 @@ public class VideoHelpers {
             channel = DatabaseHelper.getChannelFromId(
                     extractor.getUploaderUrl().substring("https://www.youtube.com/channel/".length()));
 
+        // Prioritize actual upload date
         long infoTime = Optional.ofNullable(extractor.getUploadDate())
                 .map(date -> date.offsetDateTime().toInstant().toEpochMilli())
-                .orElseGet(System::currentTimeMillis);
+                .orElse(time); // Fallback to provided time only if upload date is null
 
         if (channel != null
                 && (System.currentTimeMillis() - infoTime) < TimeUnit.DAYS.toMillis(Constants.FEED_RETENTION)) {
+
+            String latestThumbnailUrl = extractor.getThumbnails() != null && !extractor.getThumbnails().isEmpty() ? extractor.getThumbnails().getLast().getUrl() : null;
 
             try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
                 if (!DatabaseHelper.doesVideoExist(s, extractor.getId())) {
@@ -81,14 +88,17 @@ public class VideoHelpers {
                     boolean isShort = extractor.isShortFormContent() || isShort(extractor.getId());
 
                     Video video = new Video(extractor.getId(), extractor.getName(), extractor.getViewCount(), extractor.getLength(),
-                            Math.max(infoTime, time), extractor.getThumbnails().getLast().getUrl(), isShort, channel);
+                            infoTime, // Use actual upload date
+                            latestThumbnailUrl, isShort, channel);
 
                     insertVideo(video);
-
+                    // No need to update if just inserted
+                } else {
+                    // Video exists, update it (thumbnail might have changed)
+                    updateVideo(extractor.getId(), extractor.getViewCount(), extractor.getLength(), extractor.getName(), latestThumbnailUrl);
                 }
             }
         }
-
     }
 
     /**
@@ -103,10 +113,10 @@ public class VideoHelpers {
     public static void handleNewVideo(StreamInfoItem item, long time, me.kavin.piped.utils.obj.db.Channel channel) {
         if (item == null || channel == null) return;
 
-        // Check if video is recent enough based on upload date, if available
+        // Prioritize actual upload date
         long infoTime = Optional.ofNullable(item.getUploadDate())
                 .map(date -> date.offsetDateTime().toInstant().toEpochMilli())
-                .orElse(System.currentTimeMillis()); // Fallback if no date
+                .orElse(time); // Fallback to provided time only if upload date is null
 
         if ((System.currentTimeMillis() - infoTime) >= TimeUnit.DAYS.toMillis(Constants.FEED_RETENTION)) {
             return; // Skip videos older than retention period
@@ -122,25 +132,23 @@ public class VideoHelpers {
 
         if (StringUtils.isBlank(videoId)) return;
 
+        String latestThumbnailUrl = item.getThumbnails() != null && !item.getThumbnails().isEmpty() ? item.getThumbnails().getLast().getUrl() : null;
+
         try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
             if (DatabaseHelper.doesVideoExist(s, videoId)) {
-                // Video exists, update it
-                updateVideo(videoId, item);
+                // Video exists, update it (including thumbnail)
+                updateVideo(videoId, item.getViewCount(), item.getDuration(), item.getName(), latestThumbnailUrl);
             } else {
                 // Video doesn't exist, insert it
-                // Determine if it's a short (use item's property if available, else check API)
                 boolean isShort = item.isShortFormContent();
-                // Note: item.isShortFormContent() might not always be accurate.
-                // Calling isShort(videoId) is more reliable but adds an API call.
-                // We'll rely on the item's flag for polling efficiency.
 
                 Video video = new Video(
                         videoId,
                         item.getName(),
                         item.getViewCount() > 0 ? item.getViewCount() : 0, // Ensure non-negative views
                         item.getDuration() > 0 ? item.getDuration() : 0, // Ensure non-negative duration
-                        Math.max(infoTime, time), // Use upload date if available, else the provided time
-                        item.getThumbnails() != null && !item.getThumbnails().isEmpty() ? item.getThumbnails().getLast().getUrl() : null,
+                        infoTime, // Use actual upload date
+                        latestThumbnailUrl,
                         isShort,
                         channel
                 );
@@ -169,10 +177,11 @@ public class VideoHelpers {
     public static void updateVideo(String id, StreamInfo info, long time) {
         Multithreading.runAsync(() -> {
             try {
-                if (!updateVideo(id, info.getViewCount(), info.getDuration(), info.getName())) {
+                String latestThumbnailUrl = info.getThumbnails() != null && !info.getThumbnails().isEmpty() ? info.getThumbnails().getLast().getUrl() : null;
+                if (!updateVideo(id, info.getViewCount(), info.getDuration(), info.getName(), latestThumbnailUrl)) {
                     var channel = DatabaseHelper.getChannelFromId(StringUtils.substring(info.getUploaderUrl(), -24));
                     if (channel != null)
-                        handleNewVideo(info, time, channel);
+                        handleNewVideo(info, time, channel); // Pass time (which is infoTime here)
                 }
             } catch (Exception e) {
                 ExceptionHandler.handle(e);
@@ -181,10 +190,17 @@ public class VideoHelpers {
     }
 
     public static void updateVideo(String id, StreamInfoItem item) {
-        updateVideo(id, item.getViewCount(), item.getDuration(), item.getName());
+         String latestThumbnailUrl = item.getThumbnails() != null && !item.getThumbnails().isEmpty() ? item.getThumbnails().getLast().getUrl() : null;
+        updateVideo(id, item.getViewCount(), item.getDuration(), item.getName(), latestThumbnailUrl);
     }
 
+    // Overload for backward compatibility or cases where thumbnail isn't available/needed
     public static boolean updateVideo(String id, long views, long duration, String title) {
+        return updateVideo(id, views, duration, title, null); // Pass null for thumbnail
+    }
+
+    // Main update method now includes thumbnail
+    public static boolean updateVideo(String id, long views, long duration, String title, String thumbnail) {
         try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
 
             var cb = s.getCriteriaBuilder();
@@ -192,15 +208,36 @@ public class VideoHelpers {
             var root = cu.from(Video.class);
             cu.where(cb.equal(root.get("id"), id));
 
-
+            boolean changed = false;
             if (duration > 0) {
                 cu.set(root.get("duration"), duration);
+                changed = true;
             }
             if (title != null) {
                 cu.set(root.get("title"), title);
+                changed = true;
             }
             if (views > 0) {
                 cu.set(root.get("views"), views);
+                changed = true;
+            }
+            // Only update thumbnail if a non-null value is provided
+            if (thumbnail != null) {
+                 // Optional: Add a check to see if the thumbnail actually changed before setting
+                 // Video existingVideo = DatabaseHelper.getVideoFromId(s, id);
+                 // if (existingVideo != null && !thumbnail.equals(existingVideo.getThumbnail())) {
+                 //      cu.set(root.get("thumbnail"), thumbnail);
+                 //      changed = true;
+                 // } else if (existingVideo == null) { // Should not happen if updateVideo is called
+                 //      cu.set(root.get("thumbnail"), thumbnail);
+                 //      changed = true;
+                 // }
+                 cu.set(root.get("thumbnail"), thumbnail); // Simpler: always set if provided
+                 changed = true;
+            }
+
+            if (!changed) {
+                return true; // Nothing to update, but the video exists
             }
 
             long updated;
@@ -211,7 +248,7 @@ public class VideoHelpers {
                 tr.commit();
             } catch (Exception e) {
                 tr.rollback();
-
+                ExceptionHandler.handle(e, "Error updating video: " + id);
                 // return true, so that we don't try to insert a video!
                 return true;
             }
@@ -224,17 +261,21 @@ public class VideoHelpers {
         try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
             var tr = s.beginTransaction();
             try {
+                // Ensure thumbnail is not null before inserting
+                String thumbnailToInsert = video.getThumbnail() != null ? video.getThumbnail() : ""; // Use empty string if null
+
+                // Update the ON CONFLICT clause to also update the thumbnail
                 s.createNativeMutationQuery(
                                 "INSERT INTO videos (uploader_id,duration,is_short,thumbnail,title,uploaded,views,id) values " +
                                         "(:uploader_id,:duration,:is_short,:thumbnail,:title,:uploaded,:views,:id) ON CONFLICT (id) DO UPDATE SET " +
-                                        "duration = excluded.duration, title = excluded.title, views = excluded.views"
+                                        "duration = excluded.duration, title = excluded.title, views = excluded.views, thumbnail = excluded.thumbnail" // Added thumbnail update
                         )
                         .setParameter("uploader_id", video.getChannel().getUploaderId())
                         .setParameter("duration", video.getDuration())
                         .setParameter("is_short", video.isShort())
-                        .setParameter("thumbnail", video.getThumbnail())
+                        .setParameter("thumbnail", thumbnailToInsert) // Use potentially modified thumbnail
                         .setParameter("title", video.getTitle())
-                        .setParameter("uploaded", video.getUploaded())
+                        .setParameter("uploaded", video.getUploaded()) // Ensure this uses the correct date
                         .setParameter("views", video.getViews())
                         .setParameter("id", video.getId())
                         .executeUpdate();
