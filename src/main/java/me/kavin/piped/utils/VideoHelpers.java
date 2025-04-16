@@ -56,11 +56,11 @@ public class VideoHelpers {
                             infoTime, // Use actual upload date
                             latestThumbnailUrl, info.isShortFormContent(), channel);
 
-                    insertVideo(video);
-                    return;
+                    insertVideo(video); // This will insert with the correct infoTime
+                    return; // No need to update immediately after insert
                 }
             }
-            // Video exists, update it
+            // Video exists, update it (including potentially correcting the timestamp if it was wrong before)
             updateVideo(info.getId(), info, infoTime); // Pass infoTime here as well
 
         }
@@ -91,11 +91,18 @@ public class VideoHelpers {
                             infoTime, // Use actual upload date
                             latestThumbnailUrl, isShort, channel);
 
-                    insertVideo(video);
+                    insertVideo(video); // Inserts with correct infoTime
                     // No need to update if just inserted
                 } else {
-                    // Video exists, update it (thumbnail might have changed)
-                    updateVideo(extractor.getId(), extractor.getViewCount(), extractor.getLength(), extractor.getName(), latestThumbnailUrl);
+                    // Video exists, update it (thumbnail might have changed, ensure timestamp is correct)
+                    // We call insertVideo again, relying on ON CONFLICT to update the timestamp if needed.
+                    // This is slightly less direct than calling updateVideo, but ensures the timestamp logic
+                    // is centralized in the insert/conflict handling.
+                     boolean isShort = extractor.isShortFormContent() || isShort(extractor.getId());
+                     Video videoForUpdate = new Video(extractor.getId(), extractor.getName(), extractor.getViewCount(), extractor.getLength(),
+                            infoTime, // Use actual upload date
+                            latestThumbnailUrl, isShort, channel);
+                    insertVideo(videoForUpdate); // Rely on ON CONFLICT to update timestamp and other fields
                 }
             }
         }
@@ -134,28 +141,24 @@ public class VideoHelpers {
 
         String latestThumbnailUrl = item.getThumbnails() != null && !item.getThumbnails().isEmpty() ? item.getThumbnails().getLast().getUrl() : null;
 
-        try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
-            if (DatabaseHelper.doesVideoExist(s, videoId)) {
-                // Video exists, update it (including thumbnail)
-                updateVideo(videoId, item.getViewCount(), item.getDuration(), item.getName(), latestThumbnailUrl);
-            } else {
-                // Video doesn't exist, insert it
-                boolean isShort = item.isShortFormContent();
+        try {
+            // We directly call insertVideo, which handles both insertion and update (via ON CONFLICT)
+            // This ensures the timestamp logic is consistent.
+            boolean isShort = item.isShortFormContent();
+            Video videoForInsertOrUpdate = new Video(
+                    videoId,
+                    item.getName(),
+                    item.getViewCount() > 0 ? item.getViewCount() : 0, // Ensure non-negative views
+                    item.getDuration() > 0 ? item.getDuration() : 0, // Ensure non-negative duration
+                    infoTime, // Use actual upload date
+                    latestThumbnailUrl,
+                    isShort,
+                    channel
+            );
+            insertVideo(videoForInsertOrUpdate); // Handles both insert and update via ON CONFLICT
 
-                Video video = new Video(
-                        videoId,
-                        item.getName(),
-                        item.getViewCount() > 0 ? item.getViewCount() : 0, // Ensure non-negative views
-                        item.getDuration() > 0 ? item.getDuration() : 0, // Ensure non-negative duration
-                        infoTime, // Use actual upload date
-                        latestThumbnailUrl,
-                        isShort,
-                        channel
-                );
-                insertVideo(video); // Use the existing insert method
-            }
         } catch (Exception e) {
-            // Handle potential exceptions during DB check or insert/update
+            // Handle potential exceptions during DB operation
             ExceptionHandler.handle(e, "Error handling new video from StreamInfoItem: " + videoId);
         }
     }
@@ -174,14 +177,19 @@ public class VideoHelpers {
         return jsonResponse.getObject("endpoint").has("reelWatchEndpoint");
     }
 
-    public static void updateVideo(String id, StreamInfo info, long time) {
+    // This updateVideo overload is primarily called when a video *already exists*
+    // and we get new info (like view count) from StreamInfo.
+    // It should ensure the timestamp isn't accidentally overwritten with the fetch time.
+    public static void updateVideo(String id, StreamInfo info, long infoTime) { // Changed 'time' to 'infoTime' for clarity
         Multithreading.runAsync(() -> {
             try {
                 String latestThumbnailUrl = info.getThumbnails() != null && !info.getThumbnails().isEmpty() ? info.getThumbnails().getLast().getUrl() : null;
+                // Call the update method that includes thumbnail, but *not* timestamp
                 if (!updateVideo(id, info.getViewCount(), info.getDuration(), info.getName(), latestThumbnailUrl)) {
+                    // If update failed (video didn't exist), try inserting it using the correct infoTime
                     var channel = DatabaseHelper.getChannelFromId(StringUtils.substring(info.getUploaderUrl(), -24));
                     if (channel != null)
-                        handleNewVideo(info, time, channel); // Pass time (which is infoTime here)
+                        handleNewVideo(info, infoTime, channel); // Pass correct infoTime
                 }
             } catch (Exception e) {
                 ExceptionHandler.handle(e);
@@ -189,17 +197,22 @@ public class VideoHelpers {
         });
     }
 
+    // This overload is called by the polling mechanism when a video exists.
+    // It should update metadata but *not* the timestamp.
     public static void updateVideo(String id, StreamInfoItem item) {
          String latestThumbnailUrl = item.getThumbnails() != null && !item.getThumbnails().isEmpty() ? item.getThumbnails().getLast().getUrl() : null;
+         // Call the update method that includes thumbnail, but *not* timestamp
         updateVideo(id, item.getViewCount(), item.getDuration(), item.getName(), latestThumbnailUrl);
     }
 
     // Overload for backward compatibility or cases where thumbnail isn't available/needed
+    // This should NOT update the timestamp.
     public static boolean updateVideo(String id, long views, long duration, String title) {
         return updateVideo(id, views, duration, title, null); // Pass null for thumbnail
     }
 
-    // Main update method now includes thumbnail
+    // Main update method - *DOES NOT* update the 'uploaded' timestamp.
+    // Timestamp correction is handled by the ON CONFLICT clause in insertVideo.
     public static boolean updateVideo(String id, long views, long duration, String title, String thumbnail) {
         try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
 
@@ -221,23 +234,14 @@ public class VideoHelpers {
                 cu.set(root.get("views"), views);
                 changed = true;
             }
-            // Only update thumbnail if a non-null value is provided
             if (thumbnail != null) {
-                 // Optional: Add a check to see if the thumbnail actually changed before setting
-                 // Video existingVideo = DatabaseHelper.getVideoFromId(s, id);
-                 // if (existingVideo != null && !thumbnail.equals(existingVideo.getThumbnail())) {
-                 //      cu.set(root.get("thumbnail"), thumbnail);
-                 //      changed = true;
-                 // } else if (existingVideo == null) { // Should not happen if updateVideo is called
-                 //      cu.set(root.get("thumbnail"), thumbnail);
-                 //      changed = true;
-                 // }
-                 cu.set(root.get("thumbnail"), thumbnail); // Simpler: always set if provided
+                 cu.set(root.get("thumbnail"), thumbnail);
                  changed = true;
             }
 
             if (!changed) {
-                return true; // Nothing to update, but the video exists
+                // Check if the video actually exists before returning true
+                return DatabaseHelper.doesVideoExist(s, id);
             }
 
             long updated;
@@ -249,7 +253,7 @@ public class VideoHelpers {
             } catch (Exception e) {
                 tr.rollback();
                 ExceptionHandler.handle(e, "Error updating video: " + id);
-                // return true, so that we don't try to insert a video!
+                // return true, as the record likely exists but update failed
                 return true;
             }
 
@@ -257,6 +261,7 @@ public class VideoHelpers {
         }
     }
 
+    // insertVideo now handles timestamp correction via ON CONFLICT
     public static void insertVideo(Video video) {
         try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
             var tr = s.beginTransaction();
@@ -264,18 +269,18 @@ public class VideoHelpers {
                 // Ensure thumbnail is not null before inserting
                 String thumbnailToInsert = video.getThumbnail() != null ? video.getThumbnail() : ""; // Use empty string if null
 
-                // Update the ON CONFLICT clause to also update the thumbnail
+                // *** THE KEY FIX IS HERE: Added 'uploaded = excluded.uploaded' ***
                 s.createNativeMutationQuery(
                                 "INSERT INTO videos (uploader_id,duration,is_short,thumbnail,title,uploaded,views,id) values " +
                                         "(:uploader_id,:duration,:is_short,:thumbnail,:title,:uploaded,:views,:id) ON CONFLICT (id) DO UPDATE SET " +
-                                        "duration = excluded.duration, title = excluded.title, views = excluded.views, thumbnail = excluded.thumbnail" // Added thumbnail update
+                                        "duration = excluded.duration, title = excluded.title, views = excluded.views, thumbnail = excluded.thumbnail, uploaded = excluded.uploaded" // <-- Added uploaded update
                         )
                         .setParameter("uploader_id", video.getChannel().getUploaderId())
                         .setParameter("duration", video.getDuration())
                         .setParameter("is_short", video.isShort())
-                        .setParameter("thumbnail", thumbnailToInsert) // Use potentially modified thumbnail
+                        .setParameter("thumbnail", thumbnailToInsert)
                         .setParameter("title", video.getTitle())
-                        .setParameter("uploaded", video.getUploaded()) // Ensure this uses the correct date
+                        .setParameter("uploaded", video.getUploaded()) // This is the correct infoTime
                         .setParameter("views", video.getViews())
                         .setParameter("id", video.getId())
                         .executeUpdate();
